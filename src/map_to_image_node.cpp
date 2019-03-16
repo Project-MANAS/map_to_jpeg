@@ -34,7 +34,7 @@
 #include <sensor_msgs/image_encodings.h>
 
 
-#include <cv_bridge/cv_bridge.h>	
+#include <cv_bridge/cv_bridge.h>
 
 #include <image_transport/image_transport.h>
 #include <eigen3/Eigen/Geometry>
@@ -54,21 +54,25 @@ using namespace cv;
 class MapAsImageProvider
 {
 
-public:
+ public:
+
 
   MapAsImageProvider()
-    : pn_("~")
+      : pn_("~")
   {
-    check = false;
 
     image_transport_ = new image_transport::ImageTransport(n_);
     image_transport_publisher_full_position_ = image_transport_->advertise("map_image/full_with_position", 1);
     image_transport_publisher_full_ = image_transport_->advertise("map_image/full", 1);
     image_transport_publisher_tile_ = image_transport_->advertise("map_image/tile", 1);
 
-    pose_ptr_ = new geometry_msgs::PoseStamped();
-    pose_sub_ = n_.subscribe("odom", 1, &MapAsImageProvider::poseCallback, this);
-    map_sub_ = n_.subscribe("map", 1, &MapAsImageProvider::mapCallback, this);
+    odom_sub_ = n_.subscribe("odom", 1, &MapAsImageProvider::odomCallback, this);
+    pose_sub_ = n_.subscribe("pose", 1, &MapAsImageProvider::poseCallback, this);
+
+    std::string map_topic("map");
+    n_.param("map_topic", map_topic, std::string("map"));
+    map_sub_ = n_.subscribe(map_topic, 1, &MapAsImageProvider::mapCallback, this);
+    pose_pub_ = n_.advertise<geometry_msgs::PoseStamped>("pose", 1);
 
     //Which frame_id makes sense?
     cv_img_full_with_position_.header.frame_id = "map_image";
@@ -92,30 +96,40 @@ public:
     delete image_transport_;
   }
 
-  //We assume the robot position is available as a PoseStamped here (querying tf would be the more general option)
-  void poseCallback(const nav_msgs::Odometry pose)
+  void odomCallback(const nav_msgs::OdometryConstPtr& odom)
   {
-    pose_ptr_->header = pose.header;
-    pose_ptr_->pose = pose.pose.pose;
-    check = true;
+    geometry_msgs::PoseStamped pose;
+    pose.header = odom->header;
+    pose.pose = odom->pose.pose;
+    pose_pub_.publish(pose);
+  }
+
+  //We assume the robot position is available as a PoseStamped here (querying tf would be the more general option)
+  void poseCallback(const geometry_msgs::PoseStampedConstPtr& pose)
+  {
+    pose_ptr_ = pose;
   }
 
   //The map->image conversion runs every time a new map is received at the moment
   void mapCallback(const nav_msgs::OccupancyGridConstPtr& map)
   {
-    if(!check)
-      return;
     int size_x = map->info.width;
     int size_y = map->info.height;
 
-    // Only if someone is subscribed to it, do work and
+    if ((size_x < 3) || (size_y < 3) ){
+      ROS_INFO("Map size is only x: %d,  y: %d . Not running map to image conversion", size_x, size_y);
+      return;
+    }
+
+    // Only if someone is subscribed to it, do work and publish full map image
+    if (image_transport_publisher_full_.getNumSubscribers() > 0  && (pose_ptr_)){
       Mat* map_mat  = &cv_img_full_.image;
       Mat* map_mat_position  = &cv_img_full_with_position_.image;
 
       // resize cv image if it doesn't have the same dimensions as the map
       if ( (map_mat->rows != size_y) && (map_mat->cols != size_x)){
         *map_mat = Mat(size_y, size_x, CV_8U);
-	*map_mat_position = Mat(size_y, size_x, CV_8UC3);
+        *map_mat_position = Mat(size_y, size_x, CV_8UC3);
       }
 
       const std::vector<int8_t>& map_data (map->data);
@@ -137,32 +151,32 @@ public:
 
           switch (map_data[idx_map_y + x])
           {
-          case -1:
-            map_mat_position_data_p[idx*3] = 127;
-            map_mat_position_data_p[idx*3+1] = 127;
-            map_mat_position_data_p[idx*3+2] = 127;
-            map_mat_data_p[idx] = 127;
-            break;
+            case -1:
+              map_mat_position_data_p[idx*3] = 127;
+              map_mat_position_data_p[idx*3+1] = 127;
+              map_mat_position_data_p[idx*3+2] = 127;
+              map_mat_data_p[idx] = 127;
+              break;
 
-          case 0:
-            map_mat_position_data_p[idx*3] = 255;
-            map_mat_position_data_p[idx*3+1] = 255;
-            map_mat_position_data_p[idx*3+2] = 255;
-            map_mat_data_p[idx] = 255;
-            break;
+            case 0:
+              map_mat_position_data_p[idx*3] = 255;
+              map_mat_position_data_p[idx*3+1] = 255;
+              map_mat_position_data_p[idx*3+2] = 255;
+              map_mat_data_p[idx] = 255;
+              break;
 
-          case 100:
-            map_mat_position_data_p[idx*3] = 0;
-            map_mat_position_data_p[idx*3+1] = 0;
-            map_mat_position_data_p[idx*3+2] = 0;
-            map_mat_data_p[idx] = 0;
-            break;
+            case 100:
+              map_mat_position_data_p[idx*3] = 0;
+              map_mat_position_data_p[idx*3+1] = 0;
+              map_mat_position_data_p[idx*3+2] = 0;
+              map_mat_data_p[idx] = 0;
+              break;
           }
         }
-
+      }
 
       // publish the image representating the full map without the position of the robot
-      image_transport_publisher_full_.publish(cv_img_full_.toImageMsg()); 
+      image_transport_publisher_full_.publish(cv_img_full_.toImageMsg());
 
       world_map_transformer_.setTransforms(*map);
 
@@ -172,15 +186,16 @@ public:
       Eigen::Vector2i rob_position_mapi (rob_position_map.cast<int>());
 
 
-	//draw the position of the robot on the map
-	double yaw = tf::getYaw(pose_ptr_->pose.orientation);
-	double radius = size_x / 100;
-	circle(*map_mat_position, cvPoint(rob_position_mapi[0],size_y - rob_position_mapi[1]), radius, Scalar(255,0,0),3);
-	line(*map_mat_position, cvPoint(rob_position_mapi[0],size_y - rob_position_mapi[1]), cvPoint(rob_position_mapi[0] + radius*cos(yaw),size_y - rob_position_mapi[1] - radius * sin(yaw)), Scalar(255,0,0),3);
+      //draw the position of the robot on the map
+      double yaw = tf::getYaw(pose_ptr_->pose.orientation);
+      double radius = size_x / 100;
+      circle(*map_mat_position, cvPoint(rob_position_mapi[0],size_y - rob_position_mapi[1]), radius, Scalar(255,0,0),3);
+      line(*map_mat_position, cvPoint(rob_position_mapi[0],size_y - rob_position_mapi[1]), cvPoint(rob_position_mapi[0] + radius*cos(yaw),size_y - rob_position_mapi[1] - radius * sin(yaw)), Scalar(255,0,0),3);
 
-	// publish the image with position
-        image_transport_publisher_full_position_.publish(cv_img_full_with_position_.toImageMsg()); 
+      // publish the image with position
+      image_transport_publisher_full_position_.publish(cv_img_full_with_position_.toImageMsg());
     }
+
     // Only if someone is subscribed to it, do work and publish tile-based map image Also check if pose_ptr_ is valid
     if ((image_transport_publisher_tile_.getNumSubscribers() > 0) && (pose_ptr_)){
 
@@ -259,27 +274,28 @@ public:
 
           switch (map_data[idx_map_y+x])
           {
-          case 0:
-            map_mat_data_p[img_index] = 255;
-            break;
+            case 0:
+              map_mat_data_p[img_index] = 255;
+              break;
 
-          case -1:
-            map_mat_data_p[img_index] = 127;
-            break;
+            case -1:
+              map_mat_data_p[img_index] = 127;
+              break;
 
-          case 100:
-            map_mat_data_p[img_index] = 0;
-            break;
+            case 100:
+              map_mat_data_p[img_index] = 0;
+              break;
           }
-        }        
+        }
       }
       image_transport_publisher_tile_.publish(cv_img_tile_.toImageMsg());
     }
   }
-  bool check;
 
   ros::Subscriber map_sub_;
   ros::Subscriber pose_sub_;
+  ros::Subscriber odom_sub_;
+  ros::Publisher pose_pub_;
 
   image_transport::Publisher image_transport_publisher_full_;
   image_transport::Publisher image_transport_publisher_full_position_;
@@ -287,7 +303,7 @@ public:
 
   image_transport::ImageTransport* image_transport_;
 
-  geometry_msgs::PoseStamped* pose_ptr_;
+  geometry_msgs::PoseStampedConstPtr pose_ptr_;
 
   CvImage cv_img_full_;
   CvImage cv_img_full_with_position_;
@@ -303,8 +319,7 @@ public:
 
 };
 
-int main(int argc, char** argv)
-{
+int main(int argc, char** argv) {
   ros::init(argc, argv, "map_to_image_node");
 
   MapAsImageProvider map_image_provider;
